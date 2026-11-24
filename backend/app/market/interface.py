@@ -8,50 +8,48 @@ from abc import ABC, abstractmethod
 class MarketDataSource(ABC):
     """Contract for market data providers.
 
-    Implementations push price updates into a shared PriceCache on their own
-    schedule. Downstream code never calls the data source directly for prices —
-    it reads from the cache.
+    Implementations push PriceUpdates into a shared PriceCache on their own
+    schedule; they never return prices to callers.
+
+    Contract (both implementations satisfy it):
+      * Tickers are normalized with normalize_ticker() at every entry point.
+      * start() is called once; a second call raises RuntimeError.
+      * add_ticker()/remove_ticker() are idempotent and may be called before
+        start() (they edit the tracked set).
+      * remove_ticker() also evicts the ticker from the PriceCache, and no
+        later write for that ticker reaches the cache.
+      * stop() is idempotent; after it returns the source never writes again.
+      * Background failures are logged, never raised into the event loop.
 
     Lifecycle:
         source = create_market_data_source(cache)
-        await source.start(["AAPL", "GOOGL", ...])
-        # ... app runs ...
-        await source.add_ticker("TSLA")
+        await source.start(["AAPL", "GOOGL"])
+        await source.add_ticker("PYPL")
         await source.remove_ticker("GOOGL")
-        # ... app shutting down ...
         await source.stop()
     """
 
     @abstractmethod
     async def start(self, tickers: list[str]) -> None:
-        """Begin producing price updates for the given tickers.
-
-        Starts a background task that periodically writes to the PriceCache.
-        Must be called exactly once. Calling start() twice is undefined behavior.
-        """
+        """Begin producing updates for `tickers` (plus any added earlier)."""
 
     @abstractmethod
     async def stop(self) -> None:
-        """Stop the background task and release resources.
-
-        Safe to call multiple times. After stop(), the source will not write
-        to the cache again.
-        """
+        """Cancel the background task and release resources."""
 
     @abstractmethod
     async def add_ticker(self, ticker: str) -> None:
-        """Add a ticker to the active set. No-op if already present.
-
-        The next update cycle will include this ticker.
-        """
+        """Start tracking `ticker`. No-op if already tracked."""
 
     @abstractmethod
     async def remove_ticker(self, ticker: str) -> None:
-        """Remove a ticker from the active set. No-op if not present.
-
-        Also removes the ticker from the PriceCache.
-        """
+        """Stop tracking `ticker` and evict it from the cache."""
 
     @abstractmethod
     def get_tickers(self) -> list[str]:
-        """Return the current list of actively tracked tickers."""
+        """Currently tracked tickers, in insertion order."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Short identifier for logs / health endpoint: 'simulator' | 'massive'."""

@@ -1,6 +1,6 @@
 # Market Data Backend: Detailed Design (v2)
 
-**Status:** Design for implementation. It supersedes `planning/archive/MARKET_DATA_DESIGN.md`.
+**Status:** Implemented in `backend/app/market/` (191 tests, 99% coverage). It supersedes `planning/archive/MARKET_DATA_DESIGN.md`. Implementation notes: `GBMSimulator._pairwise_correlation` stays private (v1 name), and `_fetch_snapshots` takes the ticker list as an argument.
 **Scope:** All market data functionality in `backend/app/market/`: the unified API (models, cache, interface, factory), the GBM simulator, the Massive (Polygon.io) client, SSE streaming, FastAPI wiring, and watchlist/position coordination.
 **Inputs:** `PLAN.md` §6 and §10, `MARKET_DATA_SUMMARY.md`, and everything in `planning/archive/`. The design was also checked against the installed `massive` SDK and the current code in `backend/app/market/`.
 

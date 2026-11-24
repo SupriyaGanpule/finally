@@ -128,11 +128,97 @@ class TestSimulatorDataSource:
         """Test creating source with custom event probability."""
         cache = PriceCache()
         # Very high event probability for testing
-        source = SimulatorDataSource(
-            price_cache=cache, update_interval=0.1, event_probability=1.0
-        )
+        source = SimulatorDataSource(price_cache=cache, update_interval=0.1, event_probability=1.0)
         await source.start(["AAPL"])
 
         # Just verify it starts and stops cleanly
         await asyncio.sleep(0.2)
         await source.stop()
+
+    async def test_name(self):
+        assert SimulatorDataSource(price_cache=PriceCache()).name == "simulator"
+
+    async def test_start_twice_raises(self):
+        source = SimulatorDataSource(price_cache=PriceCache(), update_interval=60)
+        await source.start(["AAPL"])
+        try:
+            with pytest.raises(RuntimeError):
+                await source.start(["AAPL"])
+        finally:
+            await source.stop()
+
+    async def test_add_ticker_before_start(self):
+        """add_ticker() before start() is remembered, not silently dropped."""
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=60)
+        await source.add_ticker("PYPL")
+        assert len(cache) == 0  # nothing written before start
+
+        await source.start(["AAPL"])
+        try:
+            assert set(source.get_tickers()) == {"AAPL", "PYPL"}
+            assert "PYPL" in cache
+        finally:
+            await source.stop()
+
+    async def test_tickers_normalized(self):
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=60)
+        await source.start(["aapl"])
+        try:
+            await source.add_ticker(" tsla ")
+            await source.remove_ticker("aapl")
+            assert source.get_tickers() == ["TSLA"]
+            assert "TSLA" in cache and "AAPL" not in cache
+        finally:
+            await source.stop()
+
+    async def test_seed_price_is_session_open(self):
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=0.01, seed=1)
+        await source.start(["AAPL"])
+        await asyncio.sleep(0.05)
+        await source.stop()
+
+        update = cache.get("AAPL")
+        assert update.session_open == 190.0
+        assert update.day_change == pytest.approx(update.price - 190.0, abs=1e-6)
+
+    async def test_seeded_sources_are_reproducible(self):
+        prices = []
+        for _ in range(2):
+            source = SimulatorDataSource(price_cache=PriceCache(), seed=123)
+            source._sim.add_tickers(["AAPL", "NVDA"])
+            prices.append([source._sim.step() for _ in range(20)])
+        assert prices[0] == prices[1]
+
+    async def test_removed_ticker_never_rewritten(self):
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=0.005)
+        await source.start(["AAPL", "TSLA"])
+        await asyncio.sleep(0.02)
+        await source.remove_ticker("TSLA")
+        await asyncio.sleep(0.05)
+        await source.stop()
+        assert "TSLA" not in cache
+
+    async def test_loop_survives_step_exception(self):
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=0.005)
+        await source.start(["AAPL"])
+        original_step = source._sim.step
+        calls = {"n": 0}
+
+        def flaky_step():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return original_step()
+
+        source._sim.step = flaky_step
+        version = cache.version
+        await asyncio.sleep(0.05)
+        await source.stop()
+
+        assert calls["n"] > 1
+        assert cache.version > version
