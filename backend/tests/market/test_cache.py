@@ -101,3 +101,74 @@ class TestPriceCache:
         cache = PriceCache()
         update = cache.update("AAPL", 190.12345)
         assert update.price == 190.12
+
+    def test_session_open_defaults_to_first_price(self):
+        cache = PriceCache()
+        cache.update("AAPL", 100.0)
+        update = cache.update("AAPL", 102.0)
+        assert update.session_open == 100.0
+        assert update.day_change_percent == 2.0
+
+    def test_session_open_is_sticky(self):
+        cache = PriceCache()
+        cache.update("AAPL", 101.0, session_open=100.0)
+        update = cache.update("AAPL", 103.0)
+        assert update.session_open == 100.0
+
+    def test_session_open_can_be_replaced(self):
+        cache = PriceCache()
+        cache.update("AAPL", 101.0, session_open=100.0)
+        update = cache.update("AAPL", 101.0, session_open=99.0)
+        assert update.session_open == 99.0
+
+    def test_zero_timestamp_is_respected(self):
+        cache = PriceCache()
+        assert cache.update("AAPL", 1.0, timestamp=0.0).timestamp == 0.0
+
+    def test_remove_bumps_version(self):
+        cache = PriceCache()
+        cache.update("AAPL", 1.0)
+        version = cache.version
+        cache.remove("AAPL")
+        assert cache.version == version + 1
+
+    def test_remove_missing_does_not_bump_version(self):
+        cache = PriceCache()
+        version = cache.version
+        cache.remove("NOPE")
+        assert cache.version == version
+
+    def test_snapshot_is_consistent(self):
+        cache = PriceCache()
+        cache.update("AAPL", 1.0)
+        cache.update("GOOGL", 2.0)
+        version, prices = cache.snapshot()
+        assert version == cache.version
+        assert set(prices) == {"AAPL", "GOOGL"}
+
+    def test_snapshot_is_a_copy(self):
+        cache = PriceCache()
+        cache.update("AAPL", 1.0)
+        _, prices = cache.snapshot()
+        prices.clear()
+        assert "AAPL" in cache
+
+    def test_concurrent_writers(self):
+        """Many threads writing at once: no lost version increments."""
+        import threading
+
+        cache = PriceCache()
+        tickers = [f"T{i}" for i in range(8)]
+
+        def writer(ticker):
+            for i in range(500):
+                cache.update(ticker, 100.0 + i)
+
+        threads = [threading.Thread(target=writer, args=(t,)) for t in tickers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert cache.version == 8 * 500
+        assert all(cache.get_price(t) == 599.0 for t in tickers)

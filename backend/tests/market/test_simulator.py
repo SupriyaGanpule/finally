@@ -1,5 +1,8 @@
 """Tests for GBMSimulator."""
 
+import numpy as np
+import pytest
+
 from app.market.seed_prices import SEED_PRICES
 from app.market.simulator import GBMSimulator
 
@@ -126,6 +129,101 @@ class TestGBMSimulator:
         result = sim.step()
         price_str = str(result["AAPL"])
         # Check that we have at most 2 decimal places
-        if '.' in price_str:
-            decimal_part = price_str.split('.')[1]
+        if "." in price_str:
+            decimal_part = price_str.split(".")[1]
             assert len(decimal_part) <= 2
+
+
+class TestGBMSimulatorV2:
+    """Determinism, normalization, batching and statistical properties."""
+
+    def test_seeded_runs_are_reproducible(self):
+        a = GBMSimulator(["AAPL", "TSLA", "ZZZZ"], rng=np.random.default_rng(7))
+        b = GBMSimulator(["AAPL", "TSLA", "ZZZZ"], rng=np.random.default_rng(7))
+        assert [a.step() for _ in range(50)] == [b.step() for _ in range(50)]
+
+    def test_different_seeds_diverge(self):
+        a = GBMSimulator(["AAPL"], rng=np.random.default_rng(1))
+        b = GBMSimulator(["AAPL"], rng=np.random.default_rng(2))
+        for _ in range(100):
+            a.step()
+            b.step()
+        assert a.get_price("AAPL") != b.get_price("AAPL")
+
+    def test_tickers_are_normalized(self):
+        sim = GBMSimulator(["aapl"])
+        sim.add_ticker(" AAPL ")
+        assert sim.get_tickers() == ["AAPL"]
+        assert sim.remove_ticker("aapl") is True
+        assert sim.get_tickers() == []
+
+    def test_invalid_ticker_rejected(self):
+        sim = GBMSimulator()
+        with pytest.raises(ValueError):
+            sim.add_ticker("$$$")
+
+    def test_add_tickers_batch_returns_new_only(self):
+        sim = GBMSimulator(["AAPL"])
+        assert sim.add_tickers(["AAPL", "MSFT", "msft", "NVDA"]) == ["MSFT", "NVDA"]
+
+    def test_add_and_remove_return_flags(self):
+        sim = GBMSimulator()
+        assert sim.add_ticker("AAPL") is True
+        assert sim.add_ticker("AAPL") is False
+        assert sim.remove_ticker("AAPL") is True
+        assert sim.remove_ticker("AAPL") is False
+
+    def test_cholesky_ok_for_defaults_plus_many_unknowns(self):
+        sim = GBMSimulator(list(SEED_PRICES) + [f"X{i}" for i in range(40)])
+        assert sim._cholesky.shape == (50, 50)
+
+    def test_cholesky_shrinks_on_remove(self):
+        sim = GBMSimulator(["AAPL", "GOOGL", "MSFT"])
+        sim.remove_ticker("MSFT")
+        assert sim._cholesky.shape == (2, 2)
+        sim.remove_ticker("GOOGL")
+        assert sim._cholesky is None
+
+    def test_get_tickers_returns_copy(self):
+        sim = GBMSimulator(["AAPL"])
+        sim.get_tickers().append("X")
+        assert sim.get_tickers() == ["AAPL"]
+
+    def test_log_return_volatility_matches_sigma(self):
+        """Empirical per-tick σ of log returns ≈ σ·√dt when there are no events."""
+        sim = GBMSimulator(["AAPL"], event_probability=0.0, rng=np.random.default_rng(1))
+        prices = [sim._prices["AAPL"]]
+        for _ in range(20_000):
+            sim.step()
+            prices.append(sim._prices["AAPL"])
+        returns = np.diff(np.log(prices))
+        expected = 0.22 * np.sqrt(GBMSimulator.DEFAULT_DT)
+        assert abs(returns.std() / expected - 1) < 0.05
+
+    def test_tech_stocks_are_correlated(self):
+        """Empirical correlation of AAPL/MSFT log returns ≈ 0.6."""
+        sim = GBMSimulator(
+            ["AAPL", "MSFT", "JPM"], event_probability=0.0, rng=np.random.default_rng(3)
+        )
+        history = {t: [sim._prices[t]] for t in sim.get_tickers()}
+        for _ in range(20_000):
+            sim.step()
+            for t in history:
+                history[t].append(sim._prices[t])
+        r = {t: np.diff(np.log(p)) for t, p in history.items()}
+        assert np.corrcoef(r["AAPL"], r["MSFT"])[0, 1] == pytest.approx(0.6, abs=0.05)
+        assert np.corrcoef(r["AAPL"], r["JPM"])[0, 1] == pytest.approx(0.3, abs=0.05)
+
+    def test_events_always_fire_with_probability_one(self):
+        sim = GBMSimulator(["AAPL"], event_probability=1.0, rng=np.random.default_rng(0))
+        before = sim._prices["AAPL"]
+        sim.step()
+        move = abs(sim._prices["AAPL"] / before - 1)
+        assert 0.019 < move < 0.051
+
+    def test_no_events_with_probability_zero(self):
+        sim = GBMSimulator(["AAPL"], event_probability=0.0, rng=np.random.default_rng(0))
+        for _ in range(1000):
+            before = sim._prices["AAPL"]
+            sim.step()
+            assert abs(sim._prices["AAPL"] / before - 1) < 0.01

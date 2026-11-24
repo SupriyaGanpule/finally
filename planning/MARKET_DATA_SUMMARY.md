@@ -1,10 +1,10 @@
 # Market Data Backend — Summary
 
-**Status:** Complete, tested, reviewed, all issues resolved.
+**Status:** Complete. v2 (per `planning/MARKET_DATA_DESIGN.md`) implemented: Massive timestamp bug fixed, daily change %, Massive backoff/early-wake, ticker normalization, watchlist ∪ positions tracking, SSE heartbeat. 191 tests, 99% coverage.
 
 ## What Was Built
 
-A complete market data subsystem in `backend/app/market/` (8 modules, ~500 lines) providing live price simulation and real market data via a unified interface.
+A complete market data subsystem in `backend/app/market/` (9 modules, ~550 statements) providing live price simulation and real market data via a unified interface.
 
 ### Architecture
 
@@ -32,7 +32,8 @@ MarketDataSource (ABC)
 | `simulator.py` | `GBMSimulator` (Geometric Brownian Motion with Cholesky-correlated moves) + `SimulatorDataSource` |
 | `massive_client.py` | `MassiveDataSource` — REST polling client for Polygon.io via the `massive` package |
 | `factory.py` | `create_market_data_source()` — selects simulator or Massive based on `MASSIVE_API_KEY` env var |
-| `stream.py` | `create_stream_router()` — FastAPI SSE endpoint factory using version-based change detection |
+| `stream.py` | `create_stream_router()` — FastAPI SSE endpoint factory using version-based change detection + idle heartbeat |
+| `tracking.py` | `sync_tracked_tickers()` — reconciles the tracked set to watchlist ∪ open positions |
 
 ### Key Design Decisions
 
@@ -44,18 +45,22 @@ MarketDataSource (ABC)
 
 ## Test Suite
 
-**73 tests, all passing.** 6 test modules in `backend/tests/market/`.
+**191 tests, all passing; 99% line coverage** across 9 test modules in `backend/tests/market/`
+(models, cache, simulator, simulator source, Massive source, Massive parsing, factory/config,
+SSE stream, tracking). Massive tests build snapshots with the SDK's real `TickerSnapshot.from_dict`
+instead of `MagicMock`, which had hidden the v1 timestamp bug.
 
-| Module | Tests | Coverage |
-|--------|-------|----------|
-| test_models.py | 11 | models.py: 100% |
-| test_cache.py | 13 | cache.py: 100% |
-| test_simulator.py | 17 | simulator.py: 98% |
-| test_simulator_source.py | 10 | (integration tests) |
-| test_factory.py | 7 | factory.py: 100% |
-| test_massive.py | 13 | massive_client.py: 56% (expected — API methods mocked) |
+## v2 Changes (from `MARKET_DATA_DESIGN.md`)
 
-Overall coverage: 84%.
+1. **Massive timestamp bug fixed** — v1 read `last_trade.timestamp`, which the SDK doesn't have; every real snapshot was skipped. Now `sip_timestamp` (ns) with fallback to `updated`, unit auto-detected.
+2. **Massive price fallback** — `last_trade.price → min.close → day.close → prev_day.close`.
+3. **Daily change** — `PriceUpdate.session_open`, `day_change`, `day_change_percent` (simulator: seed price; Massive: previous close).
+4. **Massive scheduling** — exponential backoff on errors (cap 120s), early poll on `add_ticker` respecting a 12s free-tier gap, auth errors logged once, short client timeouts.
+5. **Remove race fixed** — in-flight polls cannot re-add a removed ticker.
+6. **`normalize_ticker()`** applied at every entry point; invalid symbols raise `ValueError`.
+7. **SSE** — fresh router per call, `: ping` heartbeat every 15s idle, removal pushes an update.
+8. **Config** — `MarketConfig.from_env()`: `MASSIVE_POLL_INTERVAL`, `MARKET_SIM_INTERVAL`, `MARKET_SIM_SEED`.
+9. **Simulator** — injectable RNG (deterministic tests), `add_ticker` before `start` works, fixed-rate loop.
 
 ## Code Review & Fixes Applied
 
@@ -83,7 +88,7 @@ Displays a live-updating dashboard with all 10 tickers, sparklines, color-coded 
 ## Usage for Downstream Code
 
 ```python
-from app.market import PriceCache, create_market_data_source
+from app.market import PriceCache, create_market_data_source, sync_tracked_tickers
 
 # Startup
 cache = PriceCache()
@@ -96,8 +101,8 @@ price = cache.get_price("AAPL")     # float or None
 all_prices = cache.get_all()        # dict[str, PriceUpdate]
 
 # Dynamic watchlist
-await source.add_ticker("TSLA")
-await source.remove_ticker("GOOGL")
+await sync_tracked_tickers(source, watchlist | position_tickers)
+# or directly: await source.add_ticker("TSLA"); await source.remove_ticker("GOOGL")
 
 # Shutdown
 await source.stop()
